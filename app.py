@@ -462,7 +462,7 @@ def download_youtube(url, progress=None):
     d = tempfile.mkdtemp(prefix="ivt_yt_")  # purge_old_runs() removes it after an hour
     opts = {"outtmpl": os.path.join(d, "video.%(ext)s"), "noplaylist": True, "quiet": True,
             "no_warnings": True, "restrictfilenames": True, "merge_output_format": "mp4",
-            "socket_timeout": 30,
+            "socket_timeout": 30, "retries": 5, "extractor_retries": 4, "fragment_retries": 5,
             "format": "bv*[height<=1080][vcodec^=avc1]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/b"}
     if progress:
         progress(0.02, desc="Downloading from YouTube")
