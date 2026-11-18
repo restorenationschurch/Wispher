@@ -23,3 +23,6 @@ story_work/
 
 # Personal data: who translated what (Excel log)
 records/
+
+# Downloaded Bible texts (CC BY-SA Telugu IRV): fetch with fetch_bible.py, do not commit
+bible/

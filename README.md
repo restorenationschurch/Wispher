@@ -84,3 +84,15 @@ git branch -M main
 git remote add origin https://github.com/<your-username>/indic-video-translator.git
 git push -u origin main
 ```
+
+## Extra features
+- **Word-by-word (reels) captions** and a classic sentence style: pick "Subtitle style". Fonts are in `fonts/`.
+- **YouTube link**: paste a link instead of uploading a file (uses `yt-dlp`; only translate videos you have the right to use).
+- **Voice cloning (optional)**: dub in the speaker's own voice for Hindi, Telugu, Tamil, Kannada, Malayalam, Bengali,
+  Marathi, Gujarati, Punjabi, Odia and Assamese. Install steps are in `requirements-voice-clone.txt`.
+  Only clone voices you have permission to use.
+- **Telugu Bible for scripture**: when the target is Telugu and the speaker names or quotes scripture in English,
+  verses and book names come from the Telugu IRV instead of machine translation. Run `python fetch_bible.py` once
+  (downloads the texts into `bible/`, which is not committed). The Telugu IRV is (c) 2017, 2019 Bridge Connectivity
+  Solutions, licensed CC BY-SA 4.0 (https://ebible.org/tel2017/): credit it when you publish. The app prints the
+  credit line after each run that used it.

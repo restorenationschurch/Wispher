@@ -1,0 +1,22 @@
+# Optional: "Clone the speaker's voice" (IndicF5). Install AFTER requirements.txt, in the same .venv:
+#
+#   python -m pip install --no-deps git+https://github.com/ai4bharat/IndicF5.git
+#   python -m pip install -r requirements-voice-clone.txt
+#
+# Do NOT run a plain "pip install git+https://github.com/ai4bharat/IndicF5.git": it pulls a newer
+# transformers/torch (CPU build) and breaks parler-tts and the GPU setup.
+# Also accept the licence at https://huggingface.co/ai4bharat/IndicF5 and run "hf auth login".
+# Only clone voices you have permission to use (IndicF5 terms of use).
+cached_path
+ema_pytorch>=0.5.2
+hydra-core>=1.3.0
+jieba
+pypinyin
+torchdiffeq
+transformers_stream_generator
+vocos
+x_transformers>=1.31.14
+tomli
+wandb==0.18.7     # newer wandb needs protobuf>=6, which conflicts with parler-tts
+pyarrow<19        # newer pyarrow needs numpy>=2
+datasets<4
