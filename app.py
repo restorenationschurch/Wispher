@@ -378,8 +378,19 @@ def pick_reference(segs, orig_wav, out_wav, lo=4.0, hi=11.0):
         best = (hi, s["start"], s["start"] + hi, " ".join(words[:max(1, int(len(words) * hi / dur))]))
     _, a, b, txt = best
     run(["ffmpeg", "-y", "-ss", f"{a:.2f}", "-t", f"{min(b - a, hi):.2f}", "-i", orig_wav,
-         "-ac", "1", "-ar", "24000", out_wav])
+         "-af", CLEAN_REF, "-ac", "1", "-ar", "24000", out_wav])
     return txt
+
+
+# remove rumble and steady background noise from the voice sample before cloning
+CLEAN_REF = "highpass=f=70,afftdn=nr=15:nf=-30,loudnorm=I=-20:TP=-2"
+
+
+def prepare_sample(path, out_wav, src_choice="Auto-detect", hi=11.0):
+    """The user's own voice sample (first hi seconds, cleaned) and its transcript made with Whisper."""
+    run(["ffmpeg", "-y", "-t", f"{hi:.1f}", "-i", path, "-vn", "-af", CLEAN_REF, "-ac", "1", "-ar", "24000", out_wav])
+    sub, _lang = transcribe(out_wav, src_choice)
+    return " ".join(s["text"] for s in sub).strip() or None
 
 
 def speak_clone(text, ref_wav, ref_text, out_path):
@@ -479,7 +490,7 @@ def download_youtube(url, progress=None):
 
 def process(video, src_choice, tgt_name, voice, do_dub, keep_bg, burn,
             clip_start=0, clip_len=0, res="Original resolution", sub_style=STYLE_REELS,
-            yt_url="", clone_voice=False, use_bible=True, token=None, progress=gr.Progress()):
+            yt_url="", clone_voice=False, voice_sample=None, use_bible=True, token=None, progress=gr.Progress()):
     """Checks the verification code, runs one translation and records it in the Excel log."""
     if (yt_url or "").strip():  # a YouTube link wins over an uploaded file
         video = download_youtube(yt_url, progress)
@@ -496,7 +507,8 @@ def process(video, src_choice, tgt_name, voice, do_dub, keep_bg, burn,
                 len=clip_len, res=res)
     try:
         result = _translate_impl(video, src_choice, tgt_name, voice, do_dub, keep_bg, burn,
-                                 clip_start, clip_len, res, progress, sub_style, clone_voice, use_bible)
+                                 clip_start, clip_len, res, progress, sub_style, clone_voice, use_bible,
+                                 voice_sample)
     except Exception as e:
         access_log.write_record(person, vinfo, opts, "Failed", time.time() - t0, str(e)[:200])
         raise
@@ -513,7 +525,7 @@ _nvenc_ok = True
 
 def _translate_impl(video, src_choice, tgt_name, voice, do_dub, keep_bg, burn,
                     clip_start=0, clip_len=0, res="Original resolution", progress=None,
-                    sub_style=STYLE_REELS, clone_voice=False, use_bible=True):
+                    sub_style=STYLE_REELS, clone_voice=False, use_bible=True, voice_sample=None):
     global _nvenc_ok
     if not video:
         raise gr.Error("Upload a video first.")
@@ -584,7 +596,12 @@ def _translate_impl(video, src_choice, tgt_name, voice, do_dub, keep_bg, burn,
                 clone = None
                 if clone_voice:
                     ref_wav = f"{tmp}/ref.wav"
-                    ref_txt = pick_reference(segs, orig, ref_wav) if tgt_name in CLONE_LANGS else None
+                    ref_txt = None
+                    if tgt_name in CLONE_LANGS:
+                        if voice_sample:  # a clean sample from the user beats a stretch cut from the video
+                            ref_txt = prepare_sample(voice_sample, ref_wav, src_choice)
+                        if not ref_txt:
+                            ref_txt = pick_reference(segs, orig, ref_wav)
                     if ref_txt:
                         clone = (ref_wav, ref_txt)
                     elif tgt_name not in CLONE_LANGS:
@@ -875,6 +892,10 @@ with gr.Blocks(title="Whisper Video Translator") as demo:
                                    info="Hindi, Telugu, Tamil, Kannada, Malayalam, Bengali, Marathi, Gujarati, Punjabi, Odia, "
                                         "Assamese. Uses a clear 4-11 s sample of the speaker from the video. Only clone "
                                         "voices you have permission to use. Slower than the preset voice.")
+            sample_in = gr.Audio(sources=["upload", "microphone"], type="filepath",
+                                 label="Voice sample for cloning (optional, best results)")
+            gr.Markdown("*A clear 5-11 second recording of the person speaking, no music or other voices. "
+                        "Without it, a stretch of the video's own audio is used (noisier, less accurate).*")
             bible_in = gr.Checkbox(value=True, label="Use the Telugu Bible (IRV) for scripture the speaker names or quotes",
                                    info="Telugu target and English speech only. Quoted verses and book names come from the "
                                         "Telugu Bible instead of machine translation. Needs 'python fetch_bible.py' once. "
@@ -922,7 +943,7 @@ with gr.Blocks(title="Whisper Video Translator") as demo:
             who_send.click(_send, [who_token, who_name, who_email, who_desc], [who_token, who_status])
             who_verify.click(_verify, [who_token, who_code], [who_status])
             btn.click(process, [video_in, src_in, tgt_in, voice_in, dub_in, bg_in, burn_in, start_in, len_in,
-                                res_in, style_in, yt_in, clone_in, bible_in, who_token],
+                                res_in, style_in, yt_in, clone_in, sample_in, bible_in, who_token],
                       [video_out, srt_out, dub_out, status_out], show_progress_on=video_out)
     gr.HTML('<div class="foot">Runs fully on your computer. Nothing is uploaded anywhere.</div>'
             '<div class="corner-credit">Developed and created by <b>Abhishek Surya Doppalapudi</b></div>')
