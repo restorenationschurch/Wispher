@@ -36,11 +36,17 @@ def main():
     os.chdir(ROOT)
     os.makedirs(DATA, exist_ok=True)
     env = dict(os.environ, WHISPER_NO_BROWSER="1", HF_HUB_DISABLE_SYMLINKS_WARNING="1")
+    # installed layout: runtime\ (bundled Python + packages) and bin\ (ffmpeg); otherwise the project's .venv
+    bundled = os.path.join(ROOT, "runtime", "python.exe")
+    py = bundled if os.path.exists(bundled) else os.path.join(ROOT, ".venv", "Scripts", "python.exe")
+    if os.path.exists(bundled):
+        env["PYTHONNOUSERSITE"] = "1"
+    if os.path.isdir(os.path.join(ROOT, "bin")):
+        env["PATH"] = os.path.join(ROOT, "bin") + os.pathsep + env.get("PATH", "")
     engine = None
     if not is_up():
-        py = os.path.join(ROOT, ".venv", "Scripts", "python.exe")
         if not os.path.exists(py):
-            message(f"Python environment not found in {ROOT}\\.venv. See SETUP_GPU_PC.md.")
+            message(f"Python environment not found in {ROOT}. See SETUP_GPU_PC.md.")
             return
         log = open(os.path.join(DATA, "engine.log"), "w", encoding="utf-8", errors="replace")
         engine = subprocess.Popen([py, "app.py"], cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,

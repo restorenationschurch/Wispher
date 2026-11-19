@@ -26,3 +26,6 @@ records/
 
 # Downloaded Bible texts (CC BY-SA Telugu IRV): fetch with fetch_bible.py, do not commit
 bible/
+
+# Installer build output (multi-GB)
+installer_out/
