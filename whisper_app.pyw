@@ -61,10 +61,30 @@ def main():
     if not browser:
         os.startfile(URL)  # no Edge/Chrome: default browser; the engine keeps running until you stop it
         return
-    # separate profile so this window is its own process and we can wait for it to close
-    win = subprocess.Popen([browser, f"--app={URL}", f"--user-data-dir={os.path.join(DATA, 'window')}",
-                            "--window-size=1200,900", "--no-first-run"])
-    win.wait()
+    # separate profile so we can tell when this window is closed. The new Edge process may hand over to one that
+    # is already running and exit at once, so watch for any browser process using our profile, not the child.
+    profile = os.path.join(DATA, "window")
+    win = subprocess.Popen([browser, f"--app={URL}", f"--user-data-dir={profile}", "--window-size=1200,900",
+                            "--no-first-run", "--disable-background-mode"])
+    try:
+        import psutil
+
+        def alive():
+            for p in psutil.process_iter(["name", "cmdline"]):
+                try:
+                    if (p.info["name"] or "").lower() in ("msedge.exe", "chrome.exe") and \
+                            any(profile.lower() in (a or "").lower() for a in (p.info["cmdline"] or [])):
+                        return True
+                except Exception:
+                    pass
+            return False
+        end = time.time() + 30
+        while not alive() and time.time() < end:  # give the window time to appear
+            time.sleep(0.5)
+        while alive():
+            time.sleep(1)
+    except ImportError:
+        win.wait()
     if engine and engine.poll() is None:
         engine.terminate()
 
