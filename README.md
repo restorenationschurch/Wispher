@@ -1,4 +1,4 @@
-﻿# Whisper Video Translator
+# Whisper Video Translator
 
 Developed and created by **Abhishek Surya Doppalapudi**.
 
@@ -96,3 +96,11 @@ git push -u origin main
   (downloads the texts into `bible/`, which is not committed). The Telugu IRV is (c) 2017, 2019 Bridge Connectivity
   Solutions, licensed CC BY-SA 4.0 (https://ebible.org/tel2017/): credit it when you publish. The app prints the
   credit line after each run that used it.
+
+## Run it like an app (Windows)
+`whisper_app.pyw` starts the engine, opens the translator in its own app window (Edge or Chrome app mode, no tabs)
+and stops the engine when you close the window. To get a Desktop icon, run
+`powershell -ExecutionPolicy Bypass -File create_shortcut.ps1` once. Some security software (for example
+360 Total Security) blocks scripts from creating shortcuts; then make it by hand: right-click the Desktop >
+New > Shortcut, target `C:\Wispher\.venv\Scripts\pythonw.exe "C:\Wispher\whisper_app.pyw"`, and set the icon to
+`whisper.ico` (Properties > Change Icon). Engine log: `%LOCALAPPDATA%\Whisper\engine.log`.

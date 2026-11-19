@@ -932,7 +932,9 @@ if __name__ == "__main__":
     share = os.environ.get("SHARE", "0") == "1"
     print(f"Running on: {DEVICE.upper()}" + ("" if DEVICE == "cuda" else
           "  (no GPU found - dubbing will be slow; try short clips first)"))
-    demo.queue().launch(share=share, inbrowser=not share, theme=THEME, css=CSS,
+    # WHISPER_NO_BROWSER=1 is set by Whisper.ps1 (the desktop app window), which opens its own window
+    demo.queue().launch(share=share, inbrowser=not share and os.environ.get("WHISPER_NO_BROWSER") != "1",
+                        theme=THEME, css=CSS,
                           head=FAVICON_LINK + "<script>(function(){ var go=function(){ try { ("
                                + RAIN_JS + ")(); document.documentElement.setAttribute('data-rain','ok'); }"
                                " catch(e) { document.documentElement.setAttribute('data-rain','err:'+e); } };"
