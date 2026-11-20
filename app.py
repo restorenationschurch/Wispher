@@ -726,6 +726,10 @@ def _translate_impl(video, src_choice, tgt_name, voice, do_dub, keep_bg, burn,
     purge_old_runs()
     tmp = tempfile.mkdtemp(prefix="ivt_")
     orig = f"{tmp}/orig.wav"
+    marks = [("start", time.time())]  # per-step timing, shown in the result so slow steps are easy to see
+
+    def mark(name):
+        marks.append((name, time.time()))
 
     progress(0.05, desc="Extracting audio")
     clip_start, clip_len = max(float(clip_start or 0), 0), max(float(clip_len or 0), 0)
@@ -736,6 +740,7 @@ def _translate_impl(video, src_choice, tgt_name, voice, do_dub, keep_bg, burn,
     if clip_len > 0:
         trim += ["-t", f"{clip_len:.3f}"]
     run(["ffmpeg", "-y", *trim, "-i", video, "-vn", "-ac", "2", "-ar", "44100", orig])
+    mark("audio")
 
     progress(0.15, desc="Transcribing speech")
     reels = bool(burn) and str(sub_style).startswith("Word")
@@ -747,6 +752,7 @@ def _translate_impl(video, src_choice, tgt_name, voice, do_dub, keep_bg, burn,
     if src is None:
         raise gr.Error(f"Detected language '{detected}' isn't supported as a source. "
                        "Choose the spoken language manually.")
+    mark("speech recognition")
 
     tgt = LANGS[tgt_name]
     progress(0.4, desc=f"Translating to {tgt_name}")
@@ -757,6 +763,7 @@ def _translate_impl(video, src_choice, tgt_name, voice, do_dub, keep_bg, burn,
         texts, scripture_used = scripture.translate_segments(segs, sinfo, translate, src, tgt)
     else:
         texts = translate([s["text"] for s in segs], src, tgt)
+    mark("translation")
 
     srt_name = f"subtitles_{tgt_name}.srt"
     srt = os.path.join(tmp, srt_name)
@@ -824,6 +831,7 @@ def _translate_impl(video, src_choice, tgt_name, voice, do_dub, keep_bg, burn,
                 note = f" Voice dubbing failed ({type(e).__name__}: {e}), so this video has subtitles only."
         else:
             note = f" Voice dubbing isn't available for {tgt_name}, so this video has subtitles only."
+    mark("voice")
 
     progress(0.88, desc="Building final video")
     out = os.path.join(tmp, f"translated_{tgt_name}.mp4")
@@ -873,6 +881,7 @@ def _translate_impl(video, src_choice, tgt_name, voice, do_dub, keep_bg, burn,
             if n == len(encoders) - 1:
                 raise
 
+    mark("video")
     # Remove big intermediates; keep the final video and .srt for Gradio to serve
     for f in os.listdir(tmp):
         if f.endswith(".wav") and f != "dub.wav":
@@ -881,8 +890,11 @@ def _translate_impl(video, src_choice, tgt_name, voice, do_dub, keep_bg, burn,
     if scripture_used:
         note += (f" Telugu Bible used for: {', '.join(dict.fromkeys(scripture_used))}. "
                  f"Credit for your video description: {scripture.CREDIT}")
+    steps = [f"{b[0]} {b[1] - a[1]:.0f} s" for a, b in zip(marks, marks[1:])]
+    timing = f" Time: {' · '.join(steps)} · total {marks[-1][1] - marks[0][1]:.0f} s."
+    print("[timing]" + timing, flush=True)
     status = (f"Done. Spoken language: **{CODE_TO_NAME.get(src, src)}** → "
-              f"**{tgt_name}**, {len(segs)} subtitle lines.{note}")
+              f"**{tgt_name}**, {len(segs)} subtitle lines.{note}{timing}")
     return out, srt, dub_wav, status
 
 
