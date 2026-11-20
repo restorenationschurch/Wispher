@@ -69,7 +69,34 @@ try:
 except ImportError:
     from IndicTransToolkit import IndicProcessor
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+def _pick_devices():
+    """(main, asr): the biggest GPU runs the dubbing/cloning voices and translation. With a second GPU of
+    at least ~6 GB, speech recognition (Whisper) runs there so the main GPU keeps its memory for the voices.
+    Override with WHISPER_ASR_DEVICE=cuda:N or "same"."""
+    if not torch.cuda.is_available():
+        return "cpu", "cpu"
+    n = torch.cuda.device_count()
+    mem = [torch.cuda.get_device_properties(i).total_memory for i in range(n)]
+    main = max(range(n), key=lambda i: mem[i])
+    asr, forced = main, os.environ.get("WHISPER_ASR_DEVICE", "").strip().lower()
+    if forced.startswith("cuda:") and forced[5:].isdigit() and int(forced[5:]) < n:
+        asr = int(forced[5:])
+    elif forced != "same":
+        others = [i for i in range(n) if i != main and mem[i] >= 5.5e9]
+        if others:
+            asr = max(others, key=lambda i: mem[i])
+    return f"cuda:{main}", f"cuda:{asr}"
+
+
+DEVICE, ASR_DEVICE = _pick_devices()
+IS_CUDA = DEVICE.startswith("cuda")
+if IS_CUDA:
+    torch.cuda.set_device(DEVICE)
+
+
+def fp16_ok(dev):
+    """Half precision only pays off on Ampere or newer; GTX 16xx cards run it ~4x slower than full precision."""
+    return str(dev).startswith("cuda") and torch.cuda.get_device_capability(dev)[0] >= 8
 
 # All 22 scheduled Indian languages + English (IndicTrans2 / FLORES codes)
 LANGS = {
@@ -142,8 +169,10 @@ def purge_old_runs(max_age_sec=3600):
 
 def free():
     gc.collect()
-    if DEVICE == "cuda":
-        torch.cuda.empty_cache()
+    if IS_CUDA:
+        for i in range(torch.cuda.device_count()):
+            with torch.cuda.device(i):
+                torch.cuda.empty_cache()
 
 
 _cache = {}  # models kept loaded between videos
@@ -152,11 +181,11 @@ _cache = {}  # models kept loaded between videos
 # ---------- 1. Speech to text (with timestamps) ----------
 def transcribe(audio_path, src_choice, words=False):
     if "whisper" not in _cache:  # stays loaded between videos (saves reload time)
-        _cache["whisper"] = whisper.load_model("turbo", device=DEVICE)
+        _cache["whisper"] = whisper.load_model("turbo", device=ASR_DEVICE)
     model = _cache["whisper"]
     lang = None if src_choice == "Auto-detect" else FLORES_TO_WHISPER[LANGS[src_choice]]
     result = model.transcribe(audio_path, language=lang, task="transcribe",
-                              fp16=(DEVICE == "cuda"), word_timestamps=bool(words))
+                              fp16=fp16_ok(ASR_DEVICE), word_timestamps=bool(words))
     segs = [{"start": s["start"], "end": s["end"], "text": s["text"].strip(),
              "words": [{"start": w["start"], "end": w["end"], "word": w["word"]} for w in s.get("words", [])]}
             for s in result["segments"] if s["text"].strip()]
@@ -353,7 +382,7 @@ def load_clone():
     if "indicf5" not in _cache:
         from transformers import AutoModel
         m = AutoModel.from_pretrained("ai4bharat/IndicF5", trust_remote_code=True)
-        _cache["indicf5"] = m.to(DEVICE) if DEVICE == "cuda" else m
+        _cache["indicf5"] = m.to(DEVICE) if IS_CUDA else m
     return _cache["indicf5"]
 
 
@@ -951,8 +980,12 @@ with gr.Blocks(title="Whisper Video Translator") as demo:
 if __name__ == "__main__":
     # Set SHARE=1 to get a temporary public link (e.g. when running on Google Colab)
     share = os.environ.get("SHARE", "0") == "1"
-    print(f"Running on: {DEVICE.upper()}" + ("" if DEVICE == "cuda" else
-          "  (no GPU found - dubbing will be slow; try short clips first)"))
+    if IS_CUDA:
+        main_name = torch.cuda.get_device_name(DEVICE)
+        print(f"Running on: CUDA - voices and translation on {main_name}"
+              + (f", speech recognition on {torch.cuda.get_device_name(ASR_DEVICE)}" if ASR_DEVICE != DEVICE else ""))
+    else:
+        print("Running on: CPU  (no GPU found - dubbing will be slow; try short clips first)")
     # WHISPER_NO_BROWSER=1 is set by Whisper.ps1 (the desktop app window), which opens its own window
     demo.queue().launch(share=share, inbrowser=not share and os.environ.get("WHISPER_NO_BROWSER") != "1",
                         theme=THEME, css=CSS,
