@@ -46,9 +46,6 @@ Source: "{#FfDir}\ffprobe.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "{#PyDir}\*"; DestDir: "{app}\runtime"; Excludes: "Lib\site-packages\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#Root}\.venv\Lib\site-packages\*"; DestDir: "{app}\runtime\Lib\site-packages"; Flags: ignoreversion recursesubdirs createallsubdirs
 
-[Icons]
-Name: "{autoprograms}\{#AppName}"; Filename: "{app}\runtime\pythonw.exe"; Parameters: """{app}\whisper_app.pyw"""; WorkingDir: "{app}"; IconFilename: "{app}\whisper.ico"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\runtime\pythonw.exe"; Parameters: """{app}\whisper_app.pyw"""; WorkingDir: "{app}"; IconFilename: "{app}\whisper.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\runtime\python.exe"; Parameters: "fetch_bible.py"; WorkingDir: "{app}"; Description: "Download the Telugu Bible texts for scripture matching (needs internet)"; Flags: postinstall unchecked skipifsilent
@@ -59,3 +56,50 @@ Filename: "{app}\runtime\pythonw.exe"; Parameters: """{app}\whisper_app.pyw"""; 
 Type: filesandordirs; Name: "{app}\runtime"
 Type: filesandordirs; Name: "{app}\__pycache__"
 Type: filesandordirs; Name: "{app}\bible"
+
+[Code]
+var
+  ShortcutsBlocked: Boolean;
+
+// Security software (for example 360 Total Security) can refuse to let programs save .lnk files.
+// Try, and carry on without failing the whole install if it is blocked.
+procedure MakeShortcut(Path: String);
+var
+  Shell, Link: Variant;
+begin
+  try
+    Shell := CreateOleObject('WScript.Shell');
+    Link := Shell.CreateShortcut(Path);
+    Link.TargetPath := ExpandConstant('{app}\runtime\pythonw.exe');
+    Link.Arguments := '"' + ExpandConstant('{app}\whisper_app.pyw') + '"';
+    Link.WorkingDirectory := ExpandConstant('{app}');
+    Link.IconLocation := ExpandConstant('{app}\whisper.ico');
+    Link.Description := '{#AppName}';
+    Link.Save;
+    if not FileExists(Path) then
+      ShortcutsBlocked := True;
+  except
+    Log('Shortcut blocked: ' + Path + ' - ' + GetExceptionMessage);
+    ShortcutsBlocked := True;
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    MakeShortcut(ExpandConstant('{autoprograms}\{#AppName}.lnk'));
+    if WizardIsTaskSelected('desktopicon') then
+      MakeShortcut(ExpandConstant('{autodesktop}\{#AppName}.lnk'));
+  end;
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (CurPageID = wpFinished) and ShortcutsBlocked and not WizardSilent then
+    MsgBox('The app is installed, but your security software blocked the shortcut.' + #13#10 + #13#10 +
+           'To make the icon yourself: right-click the Desktop > New > Shortcut. Target:' + #13#10 +
+           ExpandConstant('"{app}\runtime\pythonw.exe" "{app}\whisper_app.pyw"') + #13#10 +
+           'Name it "{#AppName}", then Properties > Change Icon > ' + ExpandConstant('{app}\whisper.ico') + '.',
+           mbInformation, MB_OK);
+end;
