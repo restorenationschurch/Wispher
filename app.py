@@ -1,4 +1,4 @@
-import os, gc, re, sys, json, time, shutil, subprocess, tempfile, unicodedata
+import os, gc, re, sys, json, time, shutil, subprocess, tempfile, unicodedata, threading, queue, contextlib, copy
 import torch, numpy as np, soundfile as sf
 import whisper
 import gradio as gr
@@ -70,25 +70,27 @@ except ImportError:
     from IndicTransToolkit import IndicProcessor
 
 def _pick_devices():
-    """(main, asr): the biggest GPU runs the dubbing/cloning voices and translation. With a second GPU of
-    at least ~6 GB, speech recognition (Whisper) runs there so the main GPU keeps its memory for the voices.
-    Override with WHISPER_ASR_DEVICE=cuda:N or "same"."""
+    """(main, asr, voices). The biggest GPU is `main` and runs the voices and translation; a spare GPU of at least
+    ~6 GB runs speech recognition. EXPERIMENTAL: WHISPER_DUB_GPUS=2 shares the dubbing lines between both cards
+    (speech recognition then stays on `main`); the spare card has to have ~4.5 GB free for that.
+    WHISPER_ASR_DEVICE=cuda:N overrides the ASR card."""
     if not torch.cuda.is_available():
-        return "cpu", "cpu"
+        return "cpu", "cpu", ["cpu"]
     n = torch.cuda.device_count()
     mem = [torch.cuda.get_device_properties(i).total_memory for i in range(n)]
     main = max(range(n), key=lambda i: mem[i])
-    asr, forced = main, os.environ.get("WHISPER_ASR_DEVICE", "").strip().lower()
+    others = [i for i in range(n) if i != main and mem[i] >= 5.5e9]
+    second = max(others, key=lambda i: mem[i]) if others else None
+    parallel = second is not None and os.environ.get("WHISPER_DUB_GPUS", "").strip() == "2"
+    voices = [f"cuda:{main}"] + ([f"cuda:{second}"] if parallel else [])
+    asr = main if (parallel or second is None) else second
+    forced = os.environ.get("WHISPER_ASR_DEVICE", "").strip().lower()
     if forced.startswith("cuda:") and forced[5:].isdigit() and int(forced[5:]) < n:
         asr = int(forced[5:])
-    elif forced != "same":
-        others = [i for i in range(n) if i != main and mem[i] >= 5.5e9]
-        if others:
-            asr = max(others, key=lambda i: mem[i])
-    return f"cuda:{main}", f"cuda:{asr}"
+    return f"cuda:{main}", f"cuda:{asr}", voices
 
 
-DEVICE, ASR_DEVICE = _pick_devices()
+DEVICE, ASR_DEVICE, TTS_DEVICES = _pick_devices()
 IS_CUDA = DEVICE.startswith("cuda")
 if IS_CUDA:
     torch.cuda.set_device(DEVICE)
@@ -176,16 +178,21 @@ def free():
 
 
 _cache = {}  # models kept loaded between videos
+_asr_lock = threading.Lock()
+_load_lock = threading.Lock()
 
 
 # ---------- 1. Speech to text (with timestamps) ----------
 def transcribe(audio_path, src_choice, words=False):
     if "whisper" not in _cache:  # stays loaded between videos (saves reload time)
-        _cache["whisper"] = whisper.load_model("turbo", device=ASR_DEVICE)
+        _cache["whisper"] = whisper.load_model("turbo", device=ASR_DEVICE)  # (.half() breaks its LayerNorm)
     model = _cache["whisper"]
     lang = None if src_choice == "Auto-detect" else FLORES_TO_WHISPER[LANGS[src_choice]]
-    result = model.transcribe(audio_path, language=lang, task="transcribe",
-                              fp16=fp16_ok(ASR_DEVICE), word_timestamps=bool(words))
+    with _asr_lock, (torch.cuda.device(ASR_DEVICE) if IS_CUDA else contextlib.nullcontext()):
+        # one transcription at a time; the voice-quality check calls this from the dubbing threads, so the
+        # thread's current card is set to the one Whisper lives on
+        result = model.transcribe(audio_path, language=lang, task="transcribe",
+                                  fp16=fp16_ok(ASR_DEVICE), word_timestamps=bool(words))
     segs = [{"start": s["start"], "end": s["end"], "text": s["text"].strip(),
              "words": [{"start": w["start"], "end": w["end"], "word": w["word"]} for w in s.get("words", [])]}
             for s in result["segments"] if s["text"].strip()]
@@ -346,25 +353,45 @@ def write_ass_words(events, path, width, height, lang):
 
 
 # ---------- 4. Dubbed voice (Indic Parler-TTS) ----------
-_tts = {}
+_tts = {}  # device -> loaded Parler-TTS parts
+_tts_master = {}  # CPU copy kept only when several cards need their own copy (loading the file twice crashed)
 
 
-def load_tts():
-    if not _tts:
-        name = "ai4bharat/indic-parler-tts"
-        from parler_tts import ParlerTTSForConditionalGeneration  # lazy: needs torchaudio
-        m = ParlerTTSForConditionalGeneration.from_pretrained(name).to(DEVICE)
-        _tts["model"] = m
-        _tts["tok"] = AutoTokenizer.from_pretrained(name)
-        _tts["desc_tok"] = AutoTokenizer.from_pretrained(m.config.text_encoder._name_or_path)
-    return _tts
+def seed_device(dev, seed):
+    """Seed one GPU's random generator (safe while another GPU works in another thread)."""
+    if str(dev).startswith("cuda"):
+        with torch.cuda.device(dev):
+            torch.cuda.manual_seed(seed)
+    else:
+        torch.manual_seed(seed)
 
 
-def speak(text, voice, out_path, lang="Hindi"):
-    t = load_tts()
-    d = t["desc_tok"](voice_description(lang, voice), return_tensors="pt").to(DEVICE)
-    p = t["tok"](text, return_tensors="pt").to(DEVICE)
-    torch.manual_seed(42)  # keeps the voice consistent across lines
+def load_tts(dev=None):
+    dev = dev or DEVICE
+    with _load_lock:
+        if dev not in _tts:
+            name = "ai4bharat/indic-parler-tts"
+            from parler_tts import ParlerTTSForConditionalGeneration  # lazy: needs torchaudio
+            if len(TTS_DEVICES) > 1:
+                if not _tts_master:
+                    m0 = ParlerTTSForConditionalGeneration.from_pretrained(name)  # stays on the CPU
+                    _tts_master.update(model=m0, tok=AutoTokenizer.from_pretrained(name),
+                                       desc_tok=AutoTokenizer.from_pretrained(m0.config.text_encoder._name_or_path))
+                m = copy.deepcopy(_tts_master["model"]).to(dev)
+                _tts[dev] = {"model": m, "tok": _tts_master["tok"], "desc_tok": _tts_master["desc_tok"]}
+            else:
+                m = ParlerTTSForConditionalGeneration.from_pretrained(name).to(dev)
+                _tts[dev] = {"model": m, "tok": AutoTokenizer.from_pretrained(name),
+                             "desc_tok": AutoTokenizer.from_pretrained(m.config.text_encoder._name_or_path)}
+    return _tts[dev]
+
+
+def speak(text, voice, out_path, lang="Hindi", dev=None):
+    dev = dev or DEVICE
+    t = load_tts(dev)
+    d = t["desc_tok"](voice_description(lang, voice), return_tensors="pt").to(dev)
+    p = t["tok"](text, return_tensors="pt").to(dev)
+    seed_device(dev, 42)  # keeps the voice consistent across lines
     with torch.no_grad():
         g = t["model"].generate(input_ids=d.input_ids, attention_mask=d.attention_mask,
                                 prompt_input_ids=p.input_ids,
@@ -378,12 +405,20 @@ CLONE_LANGS = {"Assamese", "Bengali", "Gujarati", "Hindi", "Kannada", "Malayalam
                "Punjabi", "Tamil", "Telugu"}
 
 
-def load_clone():
-    if "indicf5" not in _cache:
-        from transformers import AutoModel
-        m = AutoModel.from_pretrained("ai4bharat/IndicF5", trust_remote_code=True)
-        _cache["indicf5"] = m.to(DEVICE) if IS_CUDA else m
-    return _cache["indicf5"]
+def load_clone(dev=None):
+    dev = dev or DEVICE
+    key = f"indicf5@{dev}"
+    with _load_lock:
+        if key not in _cache:
+            from transformers import AutoModel
+            if len(TTS_DEVICES) > 1:
+                if "indicf5_master" not in _cache:
+                    _cache["indicf5_master"] = AutoModel.from_pretrained("ai4bharat/IndicF5", trust_remote_code=True)
+                _cache[key] = copy.deepcopy(_cache["indicf5_master"]).to(dev)
+            else:
+                m = AutoModel.from_pretrained("ai4bharat/IndicF5", trust_remote_code=True)
+                _cache[key] = m.to(dev) if IS_CUDA else m
+    return _cache[key]
 
 
 def pick_reference(segs, orig_wav, out_wav, lo=4.0, hi=11.0):
@@ -422,15 +457,44 @@ def prepare_sample(path, out_wav, src_choice="Auto-detect", hi=11.0):
     return " ".join(s["text"] for s in sub).strip() or None
 
 
-def speak_clone(text, ref_wav, ref_text, out_path):
-    m = load_clone()
-    torch.manual_seed(42)
+def looks_indic(text):
+    """True when the text is mostly Indian-script letters (IndicF5 only clones clearly from an Indian-language sample)."""
+    letters = [c for c in (text or "") if c.isalpha()]
+    return bool(letters) and sum(1 for c in letters if not ("a" <= c.lower() <= "z")) / len(letters) > 0.6
+
+
+def speak_clone(text, ref_wav, ref_text, out_path, seed=42, dev=None):
+    m = load_clone(dev)
+    seed_device(dev or DEVICE, seed)
+    m.config.speed = 1.0
     with torch.no_grad():
         a = m(text, ref_audio_path=ref_wav, ref_text=ref_text)
     a = np.asarray(a)
     if a.dtype == np.int16:
         a = a.astype(np.float32) / 32768.0
     sf.write(out_path, a.astype(np.float32).squeeze(), 24000)
+
+
+CLONE_MIN_CLEAR = 0.55   # share of a cloned line that Whisper must be able to read back (preset voice: ~0.9)
+CLONE_MAX_BAD = 0.25     # more unclear lines than this share of the video -> use the preset voice instead
+
+
+def clone_line(text, ref_wav, ref_text, raw_path, lang, dev=None):
+    """Speak one line in the cloned voice and check it is understandable; retry with other seeds. -> (ok, share)"""
+    want, best = max(speech_units(text), 1), 0.0
+    for seed in (42, 7, 123):
+        speak_clone(text, ref_wav, ref_text, raw_path, seed, dev)
+        a = AudioSegment.from_wav(raw_path)  # speech length without the silence at both ends
+        speech = max(len(a) - detect_leading_silence(a, -45) - detect_leading_silence(a.reverse(), -45), 1) / 1000
+        if not (3.0 <= want / speech <= 14.0):  # clipped (too fast) or stretched/garbled (too slow): not natural speech
+            continue
+        heard, _ = transcribe(raw_path, lang)
+        share = speech_units(" ".join(s["text"] for s in heard)) / want
+        best = max(best, share)
+        if share >= CLONE_MIN_CLEAR:
+            return True, share
+    speak_clone(text, ref_wav, ref_text, raw_path, 42, dev)  # keep a usable file even if unclear
+    return False, best
 
 
 def trim_silence(wav_path, out_path, thresh=-45):
@@ -441,40 +505,139 @@ def trim_silence(wav_path, out_path, thresh=-45):
     a[lead:len(a) - trail].export(out_path, format="wav")
 
 
-def fit_to_slot(wav_path, slot_sec, out_path, max_speed=1.6, min_speed=0.85):
-    """Make a line last about as long as the original speaker's line (speed it up if too
-    long, slow it slightly if too short) so voice and mouth movement line up."""
-    dur = sf.info(wav_path).duration
-    speed = 1.0
-    if slot_sec > 0.3:
-        speed = min(max(dur / slot_sec, min_speed), max_speed)
-    run(["ffmpeg", "-y", "-i", wav_path, "-filter:a", f"atempo={speed:.3f}",
-         "-ar", "44100", "-ac", "1", out_path])
+def speech_units(text):
+    """Rough syllable count (letters and digits, not combining marks): a script-independent length measure."""
+    return sum(1 for c in text if unicodedata.category(c)[0] in "LN")
+
+
+def change_tempo(wav_path, tempo, out_path):
+    run(["ffmpeg", "-y", "-i", wav_path, "-filter:a", f"atempo={tempo:.3f}", "-ar", "44100", "-ac", "1", out_path])
+
+
+# Dub pacing: every line is first brought to the same speaking rate (the voice itself varies from line to line),
+# then the whole video gets one common speed-up if the translation runs longer than the original speech.
+# Only lines that would still badly overrun their slot are squeezed a little more.
+PACE_EQ = (0.8, 1.3)       # per-line correction to the typical speaking rate
+PACE_GLOBAL_MAX = 1.25     # common speed-up for the whole video
+PACE_LINE_MAX = 1.6        # hard limit for one line
+PACE_OVERRUN = 0.5         # seconds a line may run past its slot before it is squeezed further
 
 
 def build_dub_track(segs, texts, voice, total_ms, tmp, progress, lang="Hindi", clone=None):
-    """clone = (reference wav, reference transcript) to speak in the original voice, else the preset voice."""
-    track = AudioSegment.silent(duration=total_ms, frame_rate=44100)
+    """clone = (reference wav, reference transcript) to speak in the original voice, else the preset voice.
+    The lines are shared out between all voice GPUs: each card takes the next waiting line when it is free."""
     n = len(segs)
-    busy_until = 0  # ms; a line never starts before the previous one has finished
-    for i, (s, txt) in enumerate(zip(segs, texts)):
-        progress(0.55 + 0.3 * i / n, desc=f"Generating voice {i + 1}/{n}")
-        if not txt.strip():
-            continue
-        raw, trim, fit = f"{tmp}/seg{i}.wav", f"{tmp}/trim{i}.wav", f"{tmp}/fit{i}.wav"
-        if clone:
-            speak_clone(txt, clone[0], clone[1], raw)
-        else:
-            speak(txt, voice, raw, lang)
-        trim_silence(raw, trim)
-        # Aim for the speaker's own mouth-movement time; allow a little spill into the gap
+    todo = queue.Queue()
+    jobs = [i for i, txt in enumerate(texts) if txt.strip()]
+    for i in jobs:
+        todo.put(i)
+    # a second card only pays off when there are enough lines to share (it also has to load its own copy of the voice)
+    devices = TTS_DEVICES if len(jobs) >= 3 else TTS_DEVICES[:1]
+    done, state = {}, {"bad": 0, "error": None, "finished": 0}
+    lock = threading.Lock()
+
+    def worker(dev):
+        if IS_CUDA:
+            torch.cuda.set_device(dev)  # CUDA's "current card" is per thread: tell this thread which card it works on
+        while state["error"] is None:
+            try:
+                i = todo.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                raw, trim = f"{tmp}/seg{i}.wav", f"{tmp}/trim{i}.wav"
+                if clone:
+                    ok, _share = clone_line(texts[i], clone[0], clone[1], raw, lang, dev)
+                    with lock:
+                        state["bad"] += 0 if ok else 1
+                        if state["bad"] > CLONE_MAX_BAD * n:
+                            raise RuntimeError("the cloned voice was not clear enough")
+                else:
+                    speak(texts[i], voice, raw, lang, dev)
+                trim_silence(raw, trim)
+                with lock:
+                    done[i] = trim
+                    state["finished"] += 1
+            except Exception as e:
+                oom = "out of memory" in str(e).lower() or "CUDA error" in str(e)
+                with lock:
+                    if oom and len(alive) > 1 and dev in alive:
+                        alive.discard(dev)  # this card cannot cope: hand the line to the others
+                        todo.put(i)
+                    else:
+                        state["error"] = state["error"] or e
+                if IS_CUDA:
+                    try:
+                        with torch.cuda.device(dev):
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                return
+
+    # load every card's copy of the voice BEFORE any thread generates (loading a model while another thread runs
+    # on the GPU crashed the process). A card that cannot load it is simply left out.
+    progress(0.55, desc="Loading the voice" + (f" on {len(devices)} GPUs" if len(devices) > 1 else ""))
+    for d in list(devices):
+        try:
+            load_clone(d) if clone else load_tts(d)
+        except Exception:
+            if d == devices[0]:
+                raise
+            devices = [x for x in devices if x != d]
+            if IS_CUDA:
+                with torch.cuda.device(d):
+                    torch.cuda.empty_cache()
+    alive = set(devices)
+    threads = [threading.Thread(target=worker, args=(d,), daemon=True) for d in devices]
+    for th in threads:
+        th.start()
+    while any(th.is_alive() for th in threads):
+        progress(0.55 + 0.3 * state["finished"] / max(len(jobs), 1),
+                 desc=f"Generating voice {state['finished'] + 1}/{len(jobs)}"
+                      + (f" on {len(devices)} GPUs" if len(devices) > 1 else ""))
+        time.sleep(0.3)
+    for th in threads:
+        th.join()
+    if state["error"] is not None:
+        raise state["error"]
+
+    clips = []
+    for i in jobs:
+        s, trim = segs[i], done[i]
         nxt = segs[i + 1]["start"] if i + 1 < n else s["end"] + 1.0
-        slot_end = max(s["end"], min(nxt - 0.1, s["end"] + 0.4))
-        fit_to_slot(trim, slot_end - s["start"], fit)
+        slot_end = max(s["end"], min(nxt - 0.1, s["end"] + 0.4))  # the speaker's own line plus a little gap
+        clips.append(dict(i=i, wav=trim, start=s["start"], slot=slot_end - s["start"],
+                          dur=max(sf.info(trim).duration, 0.05), units=speech_units(texts[i])))
+
+    # 1) the same speaking rate for every line (very short lines are left alone: their rate is unreliable)
+    usable = [c for c in clips if c["units"] >= 6 and c["dur"] >= 0.6]
+    typical = float(np.median([c["units"] / c["dur"] for c in usable])) if usable else None
+    for c in clips:
+        c["eq"] = 1.0
+        if typical and c in usable:
+            c["eq"] = min(max(typical / (c["units"] / c["dur"]), PACE_EQ[0]), PACE_EQ[1])
+        c["dur_eq"] = c["dur"] / c["eq"]
+    # 2) one common speed-up for the video if the translated speech is generally longer than the slots
+    need = [c["dur_eq"] / c["slot"] for c in clips if c["slot"] > 0.3]
+    g = min(max(float(np.percentile(need, 75)), 1.0), PACE_GLOBAL_MAX) if need else 1.0
+    # 3) squeeze only the lines that would still overrun their slot by a lot, then place them on the timeline
+    track = AudioSegment.silent(duration=total_ms, frame_rate=44100)
+    busy_until, tempos = 0, []
+    for c in clips:
+        tempo = c["eq"] * g
+        if c["slot"] > 0.3 and c["dur"] / tempo > c["slot"] + PACE_OVERRUN:
+            tempo = max(tempo, c["dur"] / (c["slot"] + PACE_OVERRUN))
+        tempo = min(max(tempo, 0.75), PACE_LINE_MAX)
+        tempos.append(tempo)
+        fit = f"{tmp}/fit{c['i']}.wav"
+        change_tempo(c["wav"], tempo, fit)
         clip = AudioSegment.from_wav(fit)
-        pos = max(int(s["start"] * 1000), busy_until)
+        pos = max(int(c["start"] * 1000), busy_until)  # a line never starts before the previous one has finished
         track = track.overlay(clip, position=pos)
         busy_until = pos + len(clip) + 80
+    if tempos:
+        print(f"[pace] typical rate {typical or 0:.1f} syllables/s | common speed-up x{g:.2f} | per-line tempo "
+              + ", ".join(f"{x:.2f}" for x in tempos), flush=True)
     return track
 
 
@@ -631,7 +794,11 @@ def _translate_impl(video, src_choice, tgt_name, voice, do_dub, keep_bg, burn,
                             ref_txt = prepare_sample(voice_sample, ref_wav, src_choice)
                         if not ref_txt:
                             ref_txt = pick_reference(segs, orig, ref_wav)
-                    if ref_txt:
+                    if ref_txt and not looks_indic(ref_txt):
+                        note += (" Voice cloning needs a voice sample in an Indian language (an English sample gives unclear"
+                                 " speech), so the preset voice was used.")
+                        ref_txt = None
+                    elif ref_txt:
                         clone = (ref_wav, ref_txt)
                     elif tgt_name not in CLONE_LANGS:
                         note += f" Voice cloning isn't available for {tgt_name}; the preset voice was used."
@@ -643,7 +810,8 @@ def _translate_impl(video, src_choice, tgt_name, voice, do_dub, keep_bg, burn,
                     if not clone:
                         raise
                     free()  # cloning failed: redo the dub with the preset voice
-                    note += f" Voice cloning failed ({type(e).__name__}), so the preset voice was used."
+                    why = str(e) if isinstance(e, RuntimeError) and "cloned voice" in str(e) else type(e).__name__
+                    note += f" Voice cloning did not work ({why}), so the preset voice was used."
                     track = build_dub_track(segs, texts, voice, total_ms, tmp, progress, tgt_name)
                 if clone and not note:
                     note = " Dubbed in the original speaker's voice."
